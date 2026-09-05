@@ -189,7 +189,7 @@ async def tombstone_absent_file_pages(
     return marked
 
 
-async def mark_stale_pages(session: Any, repo_id: str, paths: list[str]) -> int:
+async def mark_stale_pages(session: Any, repo_id: str, paths: Iterable[str]) -> int:
     """Decay weakly-affected file pages to ``freshness_status='stale'``.
 
     ``ChangeDetector.get_affected_pages`` returns ``decay_only`` — pages hit
@@ -201,28 +201,21 @@ async def mark_stale_pages(session: Any, repo_id: str, paths: list[str]) -> int:
     already-stale pages keep their stronger status, and pages regenerated in
     this run are never in ``decay_only`` by construction.
 
+    Maps each path to its ``file_page:<path>`` id and hands off to
+    :func:`mark_page_ids_stale`, so both entry points share one UPDATE.
+
+    The two were separate copies of the same statement, and only the sibling
+    was chunked against ``SQLITE_MAX_VARIABLE_NUMBER``. That is not a crash
+    anyone is hitting today: SQLite has defaulted to 32766 bind variables since
+    3.32, and a ``decay_only`` set that large would take an enormous cascade.
+    It is reachable on the 999-variable builds older interpreters still ship,
+    but the reason to collapse the two is narrower than that. They answered the
+    same question differently, in the file with the most bug fixes in this repo,
+    and now there is one place to answer it.
+
     Returns the number of pages marked.
     """
-    if not paths:
-        return 0
-    from sqlalchemy import update
-
-    from repowise.core.persistence.models import Page
-
-    page_ids = [f"file_page:{path}" for path in paths]
-    res = await session.execute(
-        update(Page)
-        .where(
-            Page.repository_id == repo_id,
-            Page.id.in_(page_ids),
-            Page.freshness_status == "fresh",
-        )
-        .values(freshness_status="stale")
-    )
-    marked = int(res.rowcount or 0)
-    if marked:
-        logger.info("pages_decayed_stale", repo_id=repo_id, count=marked)
-    return marked
+    return await mark_page_ids_stale(session, repo_id, (f"file_page:{path}" for path in paths))
 
 
 async def mark_page_ids_stale(session: Any, repo_id: str, page_ids: Iterable[str]) -> int:
@@ -289,11 +282,30 @@ def _derive_entry_point_scores(graph_builder: Any) -> dict[str, float]:
     }
 
 
+def _betweenness_commits(graph_builder: Any) -> dict[str, str | None]:
+    """Per kind, the commit its betweenness was last exactly computed at.
+
+    ``None`` means the builder cannot say, which is not "never scored" and must
+    not be written as one: a builder rehydrated from SQL serves real values it
+    did not compute, and stamping those NULL would report an entire indexed
+    repository as unscored.
+    """
+    scoring = getattr(graph_builder, "betweenness_scoring", None)
+    if scoring is None:
+        return {"file": None, "symbol": None}
+    try:
+        return {k: getattr(scoring(k), "scored_commit", None) for k in ("file", "symbol")}
+    except Exception:  # pragma: no cover - a builder without the accessor
+        return {"file": None, "symbol": None}
+
+
 async def persist_graph_nodes(
     session: Any,
     repo_id: str,
     graph_builder: Any,
     ep_scores: dict[str, float] | None = None,
+    *,
+    timings: Any | None = None,
 ) -> None:
     """Persist file- and symbol-level graph nodes with full centrality metrics.
 
@@ -306,23 +318,30 @@ async def persist_graph_nodes(
         batch_upsert_graph_node_membership,
         batch_upsert_graph_nodes,
     )
+    from repowise.core.pipeline.phase_timing import timed
 
     graph = graph_builder.graph()
-    pr = graph_builder.pagerank()
-    bc = graph_builder.betweenness_centrality()
-    sym_pr = graph_builder.symbol_pagerank()
-    sym_bc = graph_builder.symbol_betweenness_centrality()
-    cd = graph_builder.community_detection()
-    sc = graph_builder.symbol_communities()
-    ci = graph_builder.community_info()
+    with timed(timings, "persist.graph_nodes.metrics"):
+        pr = graph_builder.pagerank()
+        bc = graph_builder.betweenness_centrality()
+        sym_pr = graph_builder.symbol_pagerank()
+        sym_bc = graph_builder.symbol_betweenness_centrality()
+        cd = graph_builder.community_detection()
+        sc = graph_builder.symbol_communities()
+        ci = graph_builder.community_info()
     # ``None`` means "derive scores from the graph" (the incremental update
     # path passes nothing). An explicit ``{}`` means "no scores" and is left
     # untouched. Without this, every ``update`` re-upserted symbol nodes with
     # empty community_meta and wiped the entry_point_scores written at init,
     # leaving get_execution_flows / the dashboard panel permanently empty.
     if ep_scores is None:
-        ep_scores = _derive_entry_point_scores(graph_builder)
+        with timed(timings, "persist.graph_nodes.entry_points"):
+            ep_scores = _derive_entry_point_scores(graph_builder)
 
+    bt_commits = _betweenness_commits(graph_builder)
+
+    timings_rows = timed(timings, "persist.graph_nodes.rows")
+    timings_rows.__enter__()
     nodes = []
     for node_id in graph.nodes:
         data = graph.nodes[node_id]
@@ -344,6 +363,17 @@ async def persist_graph_nodes(
             "community_id": cd.get(node_id, 0),
         }
 
+        # Scored → its commit; in no scoring → NULL, the unscored marker;
+        # provenance unknown → key omitted, so the stored stamp survives.
+        if node_id in bc:
+            kind, scored = "file", True
+        elif node_id in sym_bc:
+            kind, scored = "symbol", True
+        else:
+            kind, scored = ("file" if node_type == "file" else "symbol"), False
+        if bt_commits[kind] is not None:
+            node_dict["betweenness_commit"] = bt_commits[kind] if scored else None
+
         community_meta: dict[str, Any] = {}
         if node_type == "file":
             cid = cd.get(node_id, 0)
@@ -352,6 +382,7 @@ async def persist_graph_nodes(
                 community_meta = {
                     "label": comm_info.label,
                     "cohesion": comm_info.cohesion,
+                    "conductance": comm_info.conductance,
                 }
         elif node_type == "symbol":
             sym_cid = sc.get(node_id)
@@ -376,15 +407,20 @@ async def persist_graph_nodes(
                 }
             )
         nodes.append(node_dict)
+    timings_rows.__exit__(None, None, None)
 
     if nodes:
-        await batch_upsert_graph_nodes(session, repo_id, nodes)
+        with timed(timings, "persist.graph_nodes.upsert"):
+            await batch_upsert_graph_nodes(session, repo_id, nodes)
 
     # Materialize the file-level metrics snapshot (graph_metrics) so large
     # repos can serve metric reads from SQL without recomputing the NetworkX
     # centrality kernels. Additive to graph_nodes; never changes node rows.
     try:
-        await batch_upsert_graph_metrics(session, repo_id, graph_builder.file_metrics_snapshot())
+        with timed(timings, "persist.graph_nodes.snapshots"):
+            await batch_upsert_graph_metrics(
+                session, repo_id, graph_builder.file_metrics_snapshot()
+            )
     except Exception as exc:  # materialization is non-load-bearing
         logger.warning("graph_metrics_materialize_skipped", error=str(exc))
 
@@ -392,9 +428,10 @@ async def persist_graph_nodes(
     # queryable rows (graph_node_membership). Feeds the break-cycle /
     # move-method refactoring surfaces; non-load-bearing like graph_metrics.
     try:
-        await batch_upsert_graph_node_membership(
-            session, repo_id, graph_builder.node_membership_snapshot()
-        )
+        with timed(timings, "persist.graph_nodes.snapshots"):
+            await batch_upsert_graph_node_membership(
+                session, repo_id, graph_builder.node_membership_snapshot()
+            )
     except Exception as exc:  # materialization is non-load-bearing
         logger.warning("graph_node_membership_materialize_skipped", error=str(exc))
 
@@ -1522,6 +1559,67 @@ async def _analyzed_commit(session: Any, repo_id: str) -> str | None:
         return None
 
 
+async def snapshot_health_from_store(session: Any, repo_id: str) -> None:
+    """Append a ``HealthSnapshot`` built from the repository's stored rows.
+
+    One writer for the full index and the incremental update. The full path
+    used to snapshot from the in-memory report and the update path never
+    snapshotted at all, so ``health --trend`` and the CLAUDE.md trend only
+    moved on a full re-index however many updates ran in between. A partial
+    report cannot be snapshotted directly, because it holds the changed files
+    and the snapshot has to describe the whole repository; the store after the
+    write holds exactly that, on both paths.
+
+    Best-effort: a snapshot that fails to write is logged and never fails the
+    run that produced the rows it describes.
+    """
+    from sqlalchemy import select
+
+    from repowise.core.analysis.health.scoring import compute_kpis
+    from repowise.core.analysis.health.trends import snapshot_file_maps
+    from repowise.core.persistence.crud import get_hotspot_file_paths, save_health_snapshot
+    from repowise.core.persistence.models import HealthFileMetric, HealthFinding
+
+    try:
+        metrics = list(
+            (
+                await session.execute(
+                    select(HealthFileMetric).where(HealthFileMetric.repository_id == repo_id)
+                )
+            )
+            .scalars()
+            .all()
+        )
+        if not metrics:
+            return
+        findings = list(
+            (
+                await session.execute(
+                    select(HealthFinding).where(
+                        HealthFinding.repository_id == repo_id,
+                        HealthFinding.status == "open",
+                    )
+                )
+            )
+            .scalars()
+            .all()
+        )
+        kpis = compute_kpis(metrics, await get_hotspot_file_paths(session, repo_id))
+        scores_map, deductions_map = snapshot_file_maps(metrics, findings)
+        await save_health_snapshot(
+            session,
+            repo_id,
+            hotspot_health=float(kpis.get("hotspot_health", 10.0)),
+            average_health=float(kpis.get("average_health", 10.0)),
+            worst_performer_path=kpis.get("worst_performer_path"),
+            worst_performer_score=kpis.get("worst_performer_score"),
+            per_file_scores=scores_map,
+            per_file_deductions=deductions_map,
+        )
+    except Exception as exc:
+        logger.warning("health_snapshot_skipped", error=str(exc))
+
+
 async def save_full_health_report(
     session: Any,
     repo_id: str,
@@ -1608,13 +1706,11 @@ async def persist_analysis(result: Any, session: Any, repo_id: str) -> None:
     decisions/governance are idempotent. Intended to run once the analysis
     phase has fully completed.
     """
-    from repowise.core.analysis.health.trends import snapshot_file_maps
     from repowise.core.persistence.crud import (
         bulk_upsert_decisions,
         recompute_decision_staleness,
         save_coverage_files,
         save_dead_code_findings,
-        save_health_snapshot,
         upsert_git_function_blame_bulk,
     )
 
@@ -1645,24 +1741,9 @@ async def persist_analysis(result: Any, session: Any, repo_id: str) -> None:
         fn_blame_rows = getattr(hr, "function_blame_rows", None)
         if fn_blame_rows:
             await upsert_git_function_blame_bulk(session, repo_id, fn_blame_rows)
-        # Snapshot the run for trend tracking (rolling delete inside).
-        kpis = hr.kpis or {}
-        try:
-            scores_map, deductions_map = snapshot_file_maps(
-                hr.metrics or [], hr.findings or []
-            )
-            await save_health_snapshot(
-                session,
-                repo_id,
-                hotspot_health=float(kpis.get("hotspot_health", 10.0)),
-                average_health=float(kpis.get("average_health", 10.0)),
-                worst_performer_path=kpis.get("worst_performer_path"),
-                worst_performer_score=kpis.get("worst_performer_score"),
-                per_file_scores=scores_map,
-                per_file_deductions=deductions_map,
-            )
-        except Exception as _snap_err:
-            logger.warning("health_snapshot_skipped", error=str(_snap_err))
+        # Snapshot the run for trend tracking (rolling delete inside). From
+        # the rows just written, by the same writer the update path uses.
+        await snapshot_health_from_store(session, repo_id)
 
     # ---- Decision records ----------------------------------------------------
     # One contributor: the multi-source extractor. A second read used to fold
@@ -1715,6 +1796,32 @@ async def persist_analysis(result: Any, session: Any, repo_id: str) -> None:
         await reconcile_source_ranks(session)
     except Exception as _rank_err:
         logger.debug("decision_rank_reconcile_skipped", error=str(_rank_err))
+
+    # Move legacy records onto ids derived from their own identity, before
+    # anything else reads or writes one. A random id is re-minted whenever a
+    # store is rebuilt rather than updated, which strands every reference held
+    # outside the row. Idempotent, and it never deletes a record.
+    try:
+        from repowise.core.persistence.decision_id_migration import apply_id_migration
+
+        await apply_id_migration(
+            session, repo_id, vector_store=getattr(result, "vector_store", None)
+        )
+    except Exception as _id_err:
+        logger.debug("decision_id_migration_skipped", error=str(_id_err))
+
+    # Classify legacy rows against the entity split. A record promoted by
+    # recurrence rather than by a person becomes a candidate, which visibly
+    # shrinks what governs; leaving it to an explicit command would instead
+    # leave the status column and the acceptance log permanently disagreeing,
+    # with half the surfaces reading each. Idempotent, and it never reopens a
+    # review action somebody already performed.
+    try:
+        from repowise.core.persistence.decision_migration import apply_migration
+
+        await apply_migration(session, repo_id)
+    except Exception as _migrate_err:
+        logger.debug("decision_entity_migration_skipped", error=str(_migrate_err))
 
     if decision_dicts:
         # Reuse the run's shared vector store for semantic (paraphrase) dedup
